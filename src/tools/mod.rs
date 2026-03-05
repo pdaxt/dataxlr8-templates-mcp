@@ -1,11 +1,21 @@
-use dataxlr8_mcp_core::mcp::{empty_schema, error_result, get_str, json_result, make_schema};
+use dataxlr8_mcp_core::mcp::{error_result, get_str, get_i64, json_result, make_schema};
 use dataxlr8_mcp_core::Database;
 use regex::Regex;
 use rmcp::model::*;
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::ServerHandler;
 use serde::{Deserialize, Serialize};
-use tracing::{error, info};
+use tracing::{error, info, warn};
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const MAX_NAME_LEN: usize = 200;
+const MAX_BODY_LEN: usize = 100_000;
+const DEFAULT_LIMIT: i64 = 50;
+const MAX_LIMIT: i64 = 200;
+const VALID_CATEGORIES: &[&str] = &["email", "proposal", "invoice", "report"];
 
 // ============================================================================
 // Data types
@@ -31,13 +41,57 @@ pub struct UsageLogEntry {
     pub rendered_at: chrono::DateTime<chrono::Utc>,
     pub variables_used: serde_json::Value,
 }
+// ============================================================================
+// Input validation helpers
+// ============================================================================
 
-#[derive(Debug, Serialize)]
-pub struct TemplateUsageReport {
-    pub template_id: String,
-    pub template_name: String,
-    pub usage_count: i32,
-    pub recent_usage: Vec<UsageLogEntry>,
+/// Extract a string param, trim it, and reject if empty.
+fn require_trimmed_str(args: &serde_json::Value, key: &str) -> Result<String, CallToolResult> {
+    match get_str(args, key) {
+        Some(v) => {
+            let trimmed = v.trim().to_string();
+            if trimmed.is_empty() {
+                Err(error_result(&format!(
+                    "Parameter '{key}' must not be empty or whitespace-only"
+                )))
+            } else {
+                Ok(trimmed)
+            }
+        }
+        None => Err(error_result(&format!(
+            "Missing required parameter: {key}"
+        ))),
+    }
+}
+
+/// Extract an optional string param and trim it. Returns None if missing.
+fn optional_trimmed_str(args: &serde_json::Value, key: &str) -> Option<String> {
+    get_str(args, key).map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
+/// Validate that a category value is one of the allowed values.
+fn validate_category(category: &str) -> Result<(), CallToolResult> {
+    if !VALID_CATEGORIES.contains(&category) {
+        return Err(error_result(&format!(
+            "Invalid category '{}'. Must be one of: {}",
+            category,
+            VALID_CATEGORIES.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// Clamp limit to [1, MAX_LIMIT], default to given default_val.
+fn parse_limit(args: &serde_json::Value, default_val: i64) -> i64 {
+    get_i64(args, "limit")
+        .unwrap_or(default_val)
+        .max(1)
+        .min(MAX_LIMIT)
+}
+
+/// Parse offset, default 0, clamp to >= 0.
+fn parse_offset(args: &serde_json::Value) -> i64 {
+    get_i64(args, "offset").unwrap_or(0).max(0)
 }
 
 // ============================================================================
@@ -90,10 +144,12 @@ fn build_tools() -> Vec<Tool> {
         Tool {
             name: "list_templates".into(),
             title: None,
-            description: Some("List all templates, optionally filtered by category".into()),
+            description: Some("List templates with optional category filter and pagination".into()),
             input_schema: make_schema(
                 serde_json::json!({
-                    "category": { "type": "string", "enum": ["email", "proposal", "invoice", "report"], "description": "Filter by category" }
+                    "category": { "type": "string", "enum": ["email", "proposal", "invoice", "report"], "description": "Filter by category" },
+                    "limit": { "type": "integer", "description": "Max results to return (default: 50, max: 200)" },
+                    "offset": { "type": "integer", "description": "Number of results to skip (default: 0)" }
                 }),
                 vec![],
             ),
@@ -180,7 +236,8 @@ fn build_tools() -> Vec<Tool> {
             input_schema: make_schema(
                 serde_json::json!({
                     "template_id": { "type": "string", "description": "Template ID or name" },
-                    "limit": { "type": "integer", "description": "Max recent usage entries to return (default: 20)" }
+                    "limit": { "type": "integer", "description": "Max recent usage entries to return (default: 50, max: 200)" },
+                    "offset": { "type": "integer", "description": "Number of entries to skip (default: 0)" }
                 }),
                 vec!["template_id"],
             ),
@@ -224,7 +281,6 @@ impl TemplatesMcpServer {
 
     /// Look up a template by ID or name.
     async fn find_template(&self, id_or_name: &str) -> Result<Option<Template>, String> {
-        // Try by ID first, then by name
         match sqlx::query_as::<_, Template>(
             "SELECT * FROM templates.templates WHERE id = $1 OR name = $1",
         )
@@ -233,25 +289,45 @@ impl TemplatesMcpServer {
         .await
         {
             Ok(t) => Ok(t),
-            Err(e) => Err(format!("Database error: {e}")),
+            Err(e) => {
+                error!(id_or_name = id_or_name, error = %e, "Database lookup failed");
+                Err(format!("Database error: {e}"))
+            }
         }
     }
 
     // ---- Tool handlers ----
 
     async fn handle_create_template(&self, args: &serde_json::Value) -> CallToolResult {
-        let name = match get_str(args, "name") {
-            Some(n) => n,
-            None => return error_result("Missing required parameter: name"),
+        let name = match require_trimmed_str(args, "name") {
+            Ok(n) => n,
+            Err(e) => return e,
         };
-        let body = match get_str(args, "body") {
-            Some(b) => b,
-            None => return error_result("Missing required parameter: body"),
+        let body = match require_trimmed_str(args, "body") {
+            Ok(b) => b,
+            Err(e) => return e,
         };
-        let category = get_str(args, "category").unwrap_or_else(|| "email".into());
+        let category = optional_trimmed_str(args, "category").unwrap_or_else(|| "email".into());
 
-        if !["email", "proposal", "invoice", "report"].contains(&category.as_str()) {
-            return error_result("category must be one of: email, proposal, invoice, report");
+        // Validate name length
+        if name.len() > MAX_NAME_LEN {
+            return error_result(&format!(
+                "Template name too long ({} chars). Maximum is {MAX_NAME_LEN}.",
+                name.len()
+            ));
+        }
+
+        // Validate body length
+        if body.len() > MAX_BODY_LEN {
+            return error_result(&format!(
+                "Template body too long ({} chars). Maximum is {MAX_BODY_LEN}.",
+                body.len()
+            ));
+        }
+
+        // Validate category
+        if let Err(e) = validate_category(&category) {
+            return e;
         }
 
         let metadata = args
@@ -275,22 +351,30 @@ impl TemplatesMcpServer {
         .await
         {
             Ok(template) => {
-                info!(name = name, category = category, "Created template");
+                info!(name = %name, category = %category, id = %id, "Created template");
                 json_result(&template)
             }
-            Err(e) => error_result(&format!("Failed to create template: {e}")),
+            Err(e) => {
+                error!(name = %name, error = %e, "Failed to create template");
+                if e.to_string().contains("unique") || e.to_string().contains("duplicate") {
+                    error_result(&format!("A template named '{name}' already exists"))
+                } else {
+                    error_result(&format!("Failed to create template: {e}"))
+                }
+            }
         }
     }
 
     async fn handle_render_template(&self, args: &serde_json::Value) -> CallToolResult {
-        let template_id = match get_str(args, "template_id") {
-            Some(t) => t,
-            None => return error_result("Missing required parameter: template_id"),
+        let template_id = match require_trimmed_str(args, "template_id") {
+            Ok(t) => t,
+            Err(e) => return e,
         };
 
         let variables = match args.get("variables") {
             Some(v) if v.is_object() => v.clone(),
-            _ => return error_result("Missing required parameter: variables (must be an object)"),
+            Some(_) => return error_result("Parameter 'variables' must be a JSON object"),
+            None => return error_result("Missing required parameter: variables"),
         };
 
         let template = match self.find_template(&template_id).await {
@@ -323,7 +407,7 @@ impl TemplatesMcpServer {
         .execute(self.db.pool())
         .await
         {
-            error!(template_id = template.id, error = %e, "Failed to log usage");
+            error!(template_id = %template.id, error = %e, "Failed to log usage");
         }
 
         // Increment usage_count
@@ -334,10 +418,10 @@ impl TemplatesMcpServer {
         .execute(self.db.pool())
         .await
         {
-            error!(template_id = template.id, error = %e, "Failed to increment usage count");
+            error!(template_id = %template.id, error = %e, "Failed to increment usage count");
         }
 
-        info!(template = template.name, "Rendered template");
+        info!(template = %template.name, "Rendered template");
         json_result(&serde_json::json!({
             "template_name": template.name,
             "rendered": rendered,
@@ -346,44 +430,74 @@ impl TemplatesMcpServer {
     }
 
     async fn handle_list_templates(&self, args: &serde_json::Value) -> CallToolResult {
-        let category = get_str(args, "category");
+        let category = optional_trimmed_str(args, "category");
+        let limit = parse_limit(args, DEFAULT_LIMIT);
+        let offset = parse_offset(args);
+
+        // Validate category if provided
+        if let Some(ref cat) = category {
+            if let Err(e) = validate_category(cat) {
+                return e;
+            }
+        }
 
         let templates: Vec<Template> = if let Some(cat) = &category {
             match sqlx::query_as(
-                "SELECT * FROM templates.templates WHERE category = $1 ORDER BY name",
+                "SELECT * FROM templates.templates WHERE category = $1 ORDER BY name LIMIT $2 OFFSET $3",
             )
             .bind(cat)
+            .bind(limit)
+            .bind(offset)
             .fetch_all(self.db.pool())
             .await
             {
                 Ok(t) => t,
-                Err(e) => return error_result(&format!("Database error: {e}")),
+                Err(e) => {
+                    error!(category = %cat, error = %e, "Failed to list templates by category");
+                    return error_result(&format!("Database error: {e}"));
+                }
             }
         } else {
-            match sqlx::query_as("SELECT * FROM templates.templates ORDER BY name")
-                .fetch_all(self.db.pool())
-                .await
+            match sqlx::query_as(
+                "SELECT * FROM templates.templates ORDER BY name LIMIT $1 OFFSET $2",
+            )
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(self.db.pool())
+            .await
             {
                 Ok(t) => t,
-                Err(e) => return error_result(&format!("Database error: {e}")),
+                Err(e) => {
+                    error!(error = %e, "Failed to list templates");
+                    return error_result(&format!("Database error: {e}"));
+                }
             }
         };
 
-        json_result(&templates)
+        json_result(&serde_json::json!({
+            "templates": templates,
+            "limit": limit,
+            "offset": offset,
+            "count": templates.len()
+        }))
     }
 
     async fn handle_get_template(&self, id_or_name: &str) -> CallToolResult {
-        match self.find_template(id_or_name).await {
+        let trimmed = id_or_name.trim();
+        if trimmed.is_empty() {
+            return error_result("Parameter 'template_id' must not be empty or whitespace-only");
+        }
+        match self.find_template(trimmed).await {
             Ok(Some(t)) => json_result(&t),
-            Ok(None) => error_result(&format!("Template '{id_or_name}' not found")),
+            Ok(None) => error_result(&format!("Template '{trimmed}' not found")),
             Err(e) => error_result(&e),
         }
     }
 
     async fn handle_update_template(&self, args: &serde_json::Value) -> CallToolResult {
-        let template_id = match get_str(args, "template_id") {
-            Some(t) => t,
-            None => return error_result("Missing required parameter: template_id"),
+        let template_id = match require_trimmed_str(args, "template_id") {
+            Ok(t) => t,
+            Err(e) => return e,
         };
 
         let existing = match self.find_template(&template_id).await {
@@ -392,15 +506,24 @@ impl TemplatesMcpServer {
             Err(e) => return error_result(&e),
         };
 
-        let body = get_str(args, "body").unwrap_or(existing.body);
-        let category = get_str(args, "category").unwrap_or(existing.category);
+        let body = optional_trimmed_str(args, "body").unwrap_or(existing.body);
+        let category = optional_trimmed_str(args, "category").unwrap_or(existing.category);
         let metadata = args
             .get("metadata")
             .cloned()
             .unwrap_or(existing.metadata);
 
-        if !["email", "proposal", "invoice", "report"].contains(&category.as_str()) {
-            return error_result("category must be one of: email, proposal, invoice, report");
+        // Validate body length
+        if body.len() > MAX_BODY_LEN {
+            return error_result(&format!(
+                "Template body too long ({} chars). Maximum is {MAX_BODY_LEN}.",
+                body.len()
+            ));
+        }
+
+        // Validate category
+        if let Err(e) = validate_category(&category) {
+            return e;
         }
 
         let variables = extract_variables(&body);
@@ -417,18 +540,25 @@ impl TemplatesMcpServer {
         .await
         {
             Ok(template) => {
-                info!(name = template.name, "Updated template");
+                info!(name = %template.name, id = %template.id, "Updated template");
                 json_result(&template)
             }
-            Err(e) => error_result(&format!("Failed to update template: {e}")),
+            Err(e) => {
+                error!(template_id = %existing.id, error = %e, "Failed to update template");
+                error_result(&format!("Failed to update template: {e}"))
+            }
         }
     }
 
     async fn handle_delete_template(&self, id_or_name: &str) -> CallToolResult {
-        // Find first to get the actual ID (CASCADE handles usage_log)
-        let template = match self.find_template(id_or_name).await {
+        let trimmed = id_or_name.trim();
+        if trimmed.is_empty() {
+            return error_result("Parameter 'template_id' must not be empty or whitespace-only");
+        }
+
+        let template = match self.find_template(trimmed).await {
             Ok(Some(t)) => t,
-            Ok(None) => return error_result(&format!("Template '{id_or_name}' not found")),
+            Ok(None) => return error_result(&format!("Template '{trimmed}' not found")),
             Err(e) => return error_result(&e),
         };
 
@@ -438,26 +568,37 @@ impl TemplatesMcpServer {
             .await
         {
             Ok(_) => {
-                info!(name = template.name, "Deleted template");
+                info!(name = %template.name, id = %template.id, "Deleted template");
                 json_result(&serde_json::json!({
                     "deleted": true,
                     "name": template.name,
                     "id": template.id
                 }))
             }
-            Err(e) => error_result(&format!("Failed to delete template: {e}")),
+            Err(e) => {
+                error!(template_id = %template.id, error = %e, "Failed to delete template");
+                error_result(&format!("Failed to delete template: {e}"))
+            }
         }
     }
 
     async fn handle_clone_template(&self, args: &serde_json::Value) -> CallToolResult {
-        let template_id = match get_str(args, "template_id") {
-            Some(t) => t,
-            None => return error_result("Missing required parameter: template_id"),
+        let template_id = match require_trimmed_str(args, "template_id") {
+            Ok(t) => t,
+            Err(e) => return e,
         };
-        let new_name = match get_str(args, "new_name") {
-            Some(n) => n,
-            None => return error_result("Missing required parameter: new_name"),
+        let new_name = match require_trimmed_str(args, "new_name") {
+            Ok(n) => n,
+            Err(e) => return e,
         };
+
+        // Validate new name length
+        if new_name.len() > MAX_NAME_LEN {
+            return error_result(&format!(
+                "Template name too long ({} chars). Maximum is {MAX_NAME_LEN}.",
+                new_name.len()
+            ));
+        }
 
         let source = match self.find_template(&template_id).await {
             Ok(Some(t)) => t,
@@ -481,8 +622,9 @@ impl TemplatesMcpServer {
         {
             Ok(template) => {
                 info!(
-                    source = source.name,
-                    clone = new_name,
+                    source = %source.name,
+                    clone = %new_name,
+                    new_id = %new_id,
                     "Cloned template"
                 );
                 json_result(&serde_json::json!({
@@ -490,21 +632,25 @@ impl TemplatesMcpServer {
                     "template": template
                 }))
             }
-            Err(e) => error_result(&format!("Failed to clone template: {e}")),
+            Err(e) => {
+                error!(source = %source.name, new_name = %new_name, error = %e, "Failed to clone template");
+                if e.to_string().contains("unique") || e.to_string().contains("duplicate") {
+                    error_result(&format!("A template named '{new_name}' already exists"))
+                } else {
+                    error_result(&format!("Failed to clone template: {e}"))
+                }
+            }
         }
     }
 
     async fn handle_template_usage(&self, args: &serde_json::Value) -> CallToolResult {
-        let template_id = match get_str(args, "template_id") {
-            Some(t) => t,
-            None => return error_result("Missing required parameter: template_id"),
+        let template_id = match require_trimmed_str(args, "template_id") {
+            Ok(t) => t,
+            Err(e) => return e,
         };
 
-        let limit = args
-            .get("limit")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(20)
-            .min(100) as i32;
+        let limit = parse_limit(args, DEFAULT_LIMIT);
+        let offset = parse_offset(args);
 
         let template = match self.find_template(&template_id).await {
             Ok(Some(t)) => t,
@@ -513,26 +659,29 @@ impl TemplatesMcpServer {
         };
 
         let recent: Vec<UsageLogEntry> = match sqlx::query_as(
-            "SELECT * FROM templates.usage_log WHERE template_id = $1 ORDER BY rendered_at DESC LIMIT $2",
+            "SELECT * FROM templates.usage_log WHERE template_id = $1 ORDER BY rendered_at DESC LIMIT $2 OFFSET $3",
         )
         .bind(&template.id)
         .bind(limit)
+        .bind(offset)
         .fetch_all(self.db.pool())
         .await
         {
             Ok(entries) => entries,
             Err(e) => {
-                error!(template_id = template.id, error = %e, "Failed to fetch usage log");
-                Vec::new()
+                error!(template_id = %template.id, error = %e, "Failed to fetch usage log");
+                return error_result(&format!("Failed to fetch usage log: {e}"));
             }
         };
 
-        json_result(&TemplateUsageReport {
-            template_id: template.id,
-            template_name: template.name,
-            usage_count: template.usage_count,
-            recent_usage: recent,
-        })
+        json_result(&serde_json::json!({
+            "template_id": template.id,
+            "template_name": template.name,
+            "usage_count": template.usage_count,
+            "recent_usage": recent,
+            "limit": limit,
+            "offset": offset
+        }))
     }
 }
 
@@ -583,18 +732,25 @@ impl ServerHandler for TemplatesMcpServer {
                 "create_template" => self.handle_create_template(&args).await,
                 "render_template" => self.handle_render_template(&args).await,
                 "list_templates" => self.handle_list_templates(&args).await,
-                "get_template" => match get_str(&args, "template_id") {
-                    Some(id) => self.handle_get_template(&id).await,
-                    None => error_result("Missing required parameter: template_id"),
-                },
+                "get_template" => {
+                    match require_trimmed_str(&args, "template_id") {
+                        Ok(id) => self.handle_get_template(&id).await,
+                        Err(e) => e,
+                    }
+                }
                 "update_template" => self.handle_update_template(&args).await,
-                "delete_template" => match get_str(&args, "template_id") {
-                    Some(id) => self.handle_delete_template(&id).await,
-                    None => error_result("Missing required parameter: template_id"),
-                },
+                "delete_template" => {
+                    match require_trimmed_str(&args, "template_id") {
+                        Ok(id) => self.handle_delete_template(&id).await,
+                        Err(e) => e,
+                    }
+                }
                 "clone_template" => self.handle_clone_template(&args).await,
                 "template_usage" => self.handle_template_usage(&args).await,
-                _ => error_result(&format!("Unknown tool: {}", request.name)),
+                _ => {
+                    warn!(tool = name_str, "Unknown tool called");
+                    error_result(&format!("Unknown tool: {}", request.name))
+                }
             };
 
             Ok(result)
