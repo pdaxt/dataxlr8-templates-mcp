@@ -5,6 +5,10 @@ edition = "2024"
 description = "Template management MCP server for DataXLR8 platform"
 repository = "https://github.com/pdaxt/dataxlr8-templates-mcp"
 
+
+[lib]
+name = "dataxlr8_templates_mcp"
+path = "src/lib.rs"
 [dependencies]
 # MCP SDK
 rmcp = { version = "0.17", features = ["server", "transport-io"] }
